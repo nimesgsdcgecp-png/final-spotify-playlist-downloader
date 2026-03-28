@@ -20,26 +20,19 @@ st.set_page_config(
 st.markdown("""
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;600&display=swap');
-
         html, body, [class*="css"] {
             font-family: 'DM Sans', sans-serif;
             background-color: #0a0a0a;
             color: #f0f0f0;
         }
         .stApp { background-color: #0a0a0a; }
-
         h1 {
             font-family: 'Space Mono', monospace;
             font-size: 2rem;
             color: #1DB954;
             letter-spacing: -1px;
         }
-        .subtitle {
-            color: #888;
-            font-size: 0.95rem;
-            margin-top: -12px;
-            margin-bottom: 24px;
-        }
+        .subtitle { color: #888; font-size: 0.95rem; margin-top: -12px; margin-bottom: 24px; }
         .stTextInput > div > div > input {
             background-color: #1a1a1a;
             border: 1px solid #2a2a2a;
@@ -58,13 +51,9 @@ st.markdown("""
             border-radius: 50px;
             padding: 10px 28px;
             font-size: 0.9rem;
-            transition: all 0.2s ease;
             width: 100%;
         }
-        .stButton > button:hover {
-            background-color: #1ed760;
-            transform: scale(1.02);
-        }
+        .stButton > button:hover { background-color: #1ed760; }
         .song-card {
             background: #141414;
             border: 1px solid #222;
@@ -76,12 +65,7 @@ st.markdown("""
             align-items: center;
             gap: 12px;
         }
-        .song-index {
-            font-family: 'Space Mono', monospace;
-            color: #1DB954;
-            font-size: 0.75rem;
-            min-width: 28px;
-        }
+        .song-index { font-family: 'Space Mono', monospace; color: #1DB954; font-size: 0.75rem; min-width: 28px; }
         .song-text { color: #ddd; line-height: 1.4; }
         .status-box {
             background: #111;
@@ -103,6 +87,17 @@ st.markdown("""
             color: #e74c3c;
             margin: 8px 0;
         }
+        .info-box {
+            background: #0a0a1a;
+            border-left: 3px solid #3a7bd5;
+            border-radius: 4px;
+            padding: 12px 16px;
+            font-family: 'Space Mono', monospace;
+            font-size: 0.78rem;
+            color: #aac4ff;
+            margin: 8px 0;
+            line-height: 1.8;
+        }
         hr { border-color: #1e1e1e; }
     </style>
 """, unsafe_allow_html=True)
@@ -117,7 +112,7 @@ st.markdown("---")
 
 
 # ─────────────────────────────────────────────
-# SESSION STATE — survives Streamlit reruns
+# SESSION STATE
 # ─────────────────────────────────────────────
 if "songs_data" not in st.session_state:
     st.session_state.songs_data = []
@@ -126,30 +121,56 @@ if "csv_bytes" not in st.session_state:
 
 
 # ─────────────────────────────────────────────
-# INPUTS
+# STEP 1 — HOW TO GET YOUR TOKEN (instructions)
 # ─────────────────────────────────────────────
-st.markdown("### Step 1 — Paste your Spotify Playlist URL")
+st.markdown("### Step 1 — Get your Spotify token")
+
+with st.expander("📖 How to get your token (30 seconds, do this once per hour)", expanded=True):
+    st.markdown("""
+<div class="info-box">
+1. Open <b>open.spotify.com</b> in your browser and log in<br>
+2. Open DevTools: press <b>F12</b> (or right-click → Inspect)<br>
+3. Click the <b>Network</b> tab<br>
+4. In the filter box type: <b>get_access_token</b><br>
+5. Refresh the Spotify page (<b>F5</b>)<br>
+6. Click the <b>get_access_token</b> request that appears<br>
+7. Click the <b>Response</b> tab<br>
+8. Copy the long value after <b>"accessToken":"</b><br>
+9. Paste it below ↓
+</div>
+""", unsafe_allow_html=True)
+
+token_input = st.text_input(
+    label="Spotify Bearer Token",
+    placeholder="Paste your accessToken here…",
+    type="password",
+    label_visibility="collapsed",
+)
+
+st.markdown("---")
+
+
+# ─────────────────────────────────────────────
+# STEP 2 — PLAYLIST URL
+# ─────────────────────────────────────────────
+st.markdown("### Step 2 — Paste your Spotify Playlist URL")
 playlist_url = st.text_input(
     label="Playlist URL",
     placeholder="https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M",
     label_visibility="collapsed",
 )
 
-st.markdown("### Step 2 — Choose Download Folder")
-
-# On Streamlit Cloud only /tmp is writable.
-# Locally this falls back to ~/spotify_downloads.
+st.markdown("### Step 3 — Choose Download Folder")
 _is_cloud    = bool(os.environ.get("STREAMLIT_SHARING_MODE") or os.environ.get("IS_CLOUD"))
 _default_dir = (
     os.path.join(tempfile.gettempdir(), "spotify_downloads")
     if _is_cloud
     else os.path.join(os.path.expanduser("~"), "spotify_downloads")
 )
-
 output_dir = st.text_input(
     label="Download folder",
     value=_default_dir,
-    help="On Streamlit Cloud only /tmp paths are writable. Locally, use any path.",
+    help="On Streamlit Cloud only /tmp paths are writable.",
     label_visibility="collapsed",
 )
 
@@ -161,10 +182,8 @@ with col2:
 
 
 # ─────────────────────────────────────────────
-# SPOTIFY SCRAPING — pure requests, no browser
+# HELPERS
 # ─────────────────────────────────────────────
-
-# These headers make Spotify's server think we are a normal browser.
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -177,59 +196,13 @@ _HEADERS = {
 }
 
 
-def _get_spotify_token() -> str:
+def scrape_all_tracks(playlist_url: str, token: str) -> list:
     """
-    Fetch Spotify's anonymous web-player bearer token.
-    This is the exact same token Spotify's own browser fetches
-    before showing you a playlist — no credentials needed.
+    Fetch ALL tracks from a public Spotify playlist using the
+    bearer token grabbed from the user's own browser.
 
-    Tries the primary endpoint first, falls back to scraping
-    the HTML if the JSON endpoint changes.
-    """
-    # Primary: dedicated JSON endpoint
-    try:
-        r = requests.get(
-            "https://open.spotify.com/get_access_token"
-            "?reason=transport&productType=web_player",
-            headers=_HEADERS,
-            timeout=15,
-        )
-        r.raise_for_status()
-        data  = r.json()
-        token = data.get("accessToken") or data.get("access_token")
-        if token:
-            return token
-    except Exception:
-        pass
-
-    # Fallback: scrape token from the Spotify home page HTML
-    r = requests.get("https://open.spotify.com/", headers=_HEADERS, timeout=15)
-    r.raise_for_status()
-    match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', r.text)
-    if match:
-        return match.group(1)
-
-    raise RuntimeError(
-        "Could not retrieve a Spotify token.\n"
-        "Possible causes:\n"
-        "• Spotify changed their web-player endpoint\n"
-        "• The server is temporarily blocking requests\n"
-        "Try again in a minute."
-    )
-
-
-def scrape_all_tracks(playlist_url: str) -> list:
-    """
-    Fetch ALL tracks from a public Spotify playlist.
-
-    Steps:
-      1. Extract playlist ID from the URL.
-      2. Get an anonymous bearer token from Spotify's web-player.
-      3. Paginate through /v1/playlists/{id}/tracks in batches of 100
-         until every track is collected.
-
-    Returns a list of dicts:
-        { index, title, artist, search_query }
+    Because the token comes from a real browser session on a real IP,
+    Spotify cannot block it. Paginates in batches of 100.
     """
     match = re.search(r"playlist/([A-Za-z0-9]+)", playlist_url)
     if not match:
@@ -237,9 +210,7 @@ def scrape_all_tracks(playlist_url: str) -> list:
             "Could not find a playlist ID in that URL.\n"
             "It should look like: https://open.spotify.com/playlist/XXXX"
         )
-    playlist_id = match.group(1)
-
-    token        = _get_spotify_token()
+    playlist_id  = match.group(1)
     auth_headers = {**_HEADERS, "Authorization": f"Bearer {token}"}
 
     tracks = []
@@ -260,13 +231,11 @@ def scrape_all_tracks(playlist_url: str) -> list:
 
         if r.status_code == 401:
             raise RuntimeError(
-                "Spotify returned 401 Unauthorized.\n"
-                "The playlist is likely private — set it to Public and try again."
+                "Token expired or invalid (401).\n"
+                "Please grab a fresh token from your browser and try again."
             )
         if r.status_code == 404:
-            raise RuntimeError(
-                "Playlist not found (404). Double-check the URL."
-            )
+            raise RuntimeError("Playlist not found (404). Double-check the URL.")
         r.raise_for_status()
 
         data = r.json()
@@ -275,9 +244,8 @@ def scrape_all_tracks(playlist_url: str) -> list:
 
         for item in data.get("items", []):
             track = item.get("track")
-            # Skip None entries (deleted/unavailable tracks in a playlist)
             if not track or not track.get("name"):
-                continue
+                continue   # skip deleted / unavailable tracks
             title   = track["name"]
             artists = ", ".join(a["name"] for a in track.get("artists", []))
             tracks.append({
@@ -287,18 +255,12 @@ def scrape_all_tracks(playlist_url: str) -> list:
                 "search_query": f"{title} {artists}",
             })
 
-        # Spotify returns null for "next" when we've reached the last page
         if not data.get("next"):
             break
-
         offset += limit
 
     return tracks
 
-
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
 
 def tracks_to_csv_bytes(tracks: list) -> bytes:
     buf    = io.StringIO()
@@ -320,13 +282,8 @@ def show_songs(songs_data: list):
 
 
 def download_song(query: str, output_folder: str) -> tuple:
-    """
-    Search YouTube for `query` and save as MP3 via yt-dlp.
-    Falls back to native audio format if ffmpeg is not installed.
-    """
     os.makedirs(output_folder, exist_ok=True)
     has_ffmpeg = shutil.which("ffmpeg") is not None
-
     cmd = [
         "yt-dlp",
         f"ytsearch1:{query}",
@@ -346,26 +303,29 @@ def download_song(query: str, output_folder: str) -> tuple:
 # ACTION — SCRAPE
 # ─────────────────────────────────────────────
 if run_scrape:
-    if not playlist_url.strip():
+    if not token_input.strip():
         st.markdown(
-            '<div class="error-box">⚠ Please paste a Spotify playlist URL first.</div>',
+            '<div class="error-box">⚠ Please paste your Spotify token first (Step 1).</div>',
+            unsafe_allow_html=True,
+        )
+    elif not playlist_url.strip():
+        st.markdown(
+            '<div class="error-box">⚠ Please paste a Spotify playlist URL (Step 2).</div>',
             unsafe_allow_html=True,
         )
     else:
         st.markdown("---")
-        st.markdown("### Fetching playlist…")
-        with st.spinner("🌐 Contacting Spotify…"):
+        with st.spinner("🌐 Fetching all tracks from Spotify…"):
             try:
-                tracks = scrape_all_tracks(playlist_url.strip())
+                tracks = scrape_all_tracks(playlist_url.strip(), token_input.strip())
 
                 if not tracks:
                     st.markdown(
                         '<div class="error-box">No tracks found. '
-                        'Make sure the playlist is <b>public</b> and the URL is correct.</div>',
+                        'Make sure the playlist is <b>public</b>.</div>',
                         unsafe_allow_html=True,
                     )
                 else:
-                    # Persist across reruns
                     st.session_state.songs_data = tracks
                     st.session_state.csv_bytes  = tracks_to_csv_bytes(tracks)
 
@@ -389,7 +349,6 @@ if run_scrape:
                     unsafe_allow_html=True,
                 )
 
-# Keep showing previously scraped songs after any rerun
 elif st.session_state.songs_data:
     st.markdown(f"#### {len(st.session_state.songs_data)} tracks (from last scrape)")
     show_songs(st.session_state.songs_data)
@@ -423,8 +382,8 @@ if run_download:
         if not shutil.which("ffmpeg"):
             st.markdown(
                 '<div class="status-box">⚠ ffmpeg not found — files will download in '
-                'native format instead of MP3. Add <code>ffmpeg</code> to '
-                '<code>packages.txt</code> to enable MP3 on Streamlit Cloud.</div>',
+                'native format. Add <code>ffmpeg</code> to <code>packages.txt</code> '
+                'for MP3 on Streamlit Cloud.</div>',
                 unsafe_allow_html=True,
             )
 
@@ -452,9 +411,7 @@ if run_download:
                 log_lines[-1] = f"[{i}/{total}] ✅ {title} — {artist}"
             else:
                 fail_count += 1
-                log_lines[-1] = (
-                    f"[{i}/{total}] ❌ {title} — {artist}  ({err.strip()[:80]})"
-                )
+                log_lines[-1] = f"[{i}/{total}] ❌ {title} — {artist}  ({err.strip()[:80]})"
 
             progress_bar.progress(i / total)
             log_area.markdown(
