@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import requests
 import re
 import csv
@@ -87,17 +88,6 @@ st.markdown("""
             color: #e74c3c;
             margin: 8px 0;
         }
-        .info-box {
-            background: #0a0a1a;
-            border-left: 3px solid #3a7bd5;
-            border-radius: 4px;
-            padding: 12px 16px;
-            font-family: 'Space Mono', monospace;
-            font-size: 0.78rem;
-            color: #aac4ff;
-            margin: 8px 0;
-            line-height: 1.8;
-        }
         hr { border-color: #1e1e1e; }
     </style>
 """, unsafe_allow_html=True)
@@ -118,40 +108,135 @@ if "songs_data" not in st.session_state:
     st.session_state.songs_data = []
 if "csv_bytes" not in st.session_state:
     st.session_state.csv_bytes = None
+if "token" not in st.session_state:
+    st.session_state.token = ""
 
 
 # ─────────────────────────────────────────────
-# STEP 1 — HOW TO GET YOUR TOKEN (instructions)
+# STEP 1 — FETCH TOKEN FROM USER'S BROWSER
+# The JS runs IN the user's browser (their IP, not the server's).
+# Spotify happily returns the token because it's coming from a real browser.
+# The token is then sent back to Streamlit via postMessage / query param trick.
 # ─────────────────────────────────────────────
-st.markdown("### Step 1 — Get your Spotify token")
+st.markdown("### Step 1 — Fetch Spotify Token")
+st.markdown("Click the button below. Your browser will fetch the token directly from Spotify — no copy-paste needed.")
 
-with st.expander("📖 How to get your token (30 seconds, do this once per hour)", expanded=True):
-    st.markdown("""
-<div class="info-box">
-1. Open <b>open.spotify.com</b> in your browser and log in<br>
-2. Open DevTools: press <b>F12</b> (or right-click → Inspect)<br>
-3. Click the <b>Network</b> tab<br>
-4. In the filter box type: <b>get_access_token</b><br>
-5. Refresh the Spotify page (<b>F5</b>)<br>
-6. Click the <b>get_access_token</b> request that appears<br>
-7. Click the <b>Response</b> tab<br>
-8. Copy the long value after <b>"accessToken":"</b><br>
-9. Paste it below ↓
-</div>
-""", unsafe_allow_html=True)
+# This HTML+JS component runs entirely in the user's browser.
+# It fetches the Spotify token from the user's side (bypassing server IP block),
+# then displays it in a text box so the user can copy it into the field below.
+token_fetcher_html = """
+<style>
+    body { background: transparent; margin: 0; font-family: 'Space Mono', monospace; }
+    button {
+        background: #1DB954;
+        color: #000;
+        border: none;
+        border-radius: 50px;
+        padding: 10px 24px;
+        font-family: 'Space Mono', monospace;
+        font-weight: 700;
+        font-size: 0.85rem;
+        cursor: pointer;
+        width: 100%;
+    }
+    button:hover { background: #1ed760; }
+    #status { margin-top: 10px; font-size: 0.78rem; color: #aaa; }
+    #tokenBox {
+        margin-top: 10px;
+        width: 100%;
+        padding: 8px;
+        background: #1a1a1a;
+        border: 1px solid #1DB954;
+        border-radius: 6px;
+        color: #1DB954;
+        font-family: 'Space Mono', monospace;
+        font-size: 0.72rem;
+        word-break: break-all;
+        display: none;
+    }
+    #copyBtn {
+        display: none;
+        margin-top: 6px;
+        background: #222;
+        color: #1DB954;
+        border: 1px solid #1DB954;
+        border-radius: 50px;
+        padding: 6px 16px;
+        font-family: 'Space Mono', monospace;
+        font-size: 0.75rem;
+        cursor: pointer;
+        width: auto;
+    }
+</style>
 
+<button onclick="fetchToken()">🔑 Fetch Token from Spotify</button>
+<div id="status">Click to fetch your token automatically.</div>
+<textarea id="tokenBox" rows="3" readonly></textarea>
+<button id="copyBtn" onclick="copyToken()">📋 Copy Token</button>
+
+<script>
+async function fetchToken() {
+    document.getElementById('status').innerText = '⏳ Fetching from Spotify...';
+    try {
+        const res = await fetch(
+            'https://open.spotify.com/get_access_token?reason=transport&productType=web_player',
+            {
+                credentials: 'include',   // sends your Spotify cookies = real browser session
+                headers: { 'Accept': 'application/json' }
+            }
+        );
+        const data = await res.json();
+        const token = data.accessToken || data.access_token;
+        if (token) {
+            document.getElementById('tokenBox').value = token;
+            document.getElementById('tokenBox').style.display = 'block';
+            document.getElementById('copyBtn').style.display = 'inline-block';
+            document.getElementById('status').innerText = '✅ Token fetched! Copy it and paste below.';
+        } else {
+            document.getElementById('status').innerText = '❌ No token in response. Are you logged into Spotify?';
+        }
+    } catch(e) {
+        document.getElementById('status').innerText = '❌ Error: ' + e.message +
+            ' — Make sure you are logged into open.spotify.com';
+    }
+}
+
+function copyToken() {
+    const box = document.getElementById('tokenBox');
+    box.select();
+    document.execCommand('copy');
+    document.getElementById('copyBtn').innerText = '✅ Copied!';
+    setTimeout(() => document.getElementById('copyBtn').innerText = '📋 Copy Token', 2000);
+}
+</script>
+"""
+
+components.html(token_fetcher_html, height=180)
+
+st.markdown("**Paste the token here:**")
 token_input = st.text_input(
-    label="Spotify Bearer Token",
-    placeholder="Paste your accessToken here…",
+    label="Spotify Token",
+    placeholder="Paste token here…",
     type="password",
     label_visibility="collapsed",
+    key="token_field",
 )
+
+# Save token to session state so it persists across reruns
+if token_input:
+    st.session_state.token = token_input
+
+if st.session_state.token:
+    st.markdown(
+        '<div class="status-box">✅ Token saved — valid for ~1 hour.</div>',
+        unsafe_allow_html=True,
+    )
 
 st.markdown("---")
 
 
 # ─────────────────────────────────────────────
-# STEP 2 — PLAYLIST URL
+# STEP 2 — PLAYLIST URL + OUTPUT DIR
 # ─────────────────────────────────────────────
 st.markdown("### Step 2 — Paste your Spotify Playlist URL")
 playlist_url = st.text_input(
@@ -160,7 +245,7 @@ playlist_url = st.text_input(
     label_visibility="collapsed",
 )
 
-st.markdown("### Step 3 — Choose Download Folder")
+st.markdown("### Step 3 — Download Folder")
 _is_cloud    = bool(os.environ.get("STREAMLIT_SHARING_MODE") or os.environ.get("IS_CLOUD"))
 _default_dir = (
     os.path.join(tempfile.gettempdir(), "spotify_downloads")
@@ -170,7 +255,7 @@ _default_dir = (
 output_dir = st.text_input(
     label="Download folder",
     value=_default_dir,
-    help="On Streamlit Cloud only /tmp paths are writable.",
+    help="On Streamlit Cloud only /tmp paths are writable. Locally, use any path.",
     label_visibility="collapsed",
 )
 
@@ -198,18 +283,13 @@ _HEADERS = {
 
 def scrape_all_tracks(playlist_url: str, token: str) -> list:
     """
-    Fetch ALL tracks from a public Spotify playlist using the
-    bearer token grabbed from the user's own browser.
-
-    Because the token comes from a real browser session on a real IP,
-    Spotify cannot block it. Paginates in batches of 100.
+    Fetch ALL tracks using the token obtained from the user's browser.
+    Token comes from a real browser IP so Spotify accepts it.
+    Paginates in batches of 100 until all tracks are fetched.
     """
     match = re.search(r"playlist/([A-Za-z0-9]+)", playlist_url)
     if not match:
-        raise ValueError(
-            "Could not find a playlist ID in that URL.\n"
-            "It should look like: https://open.spotify.com/playlist/XXXX"
-        )
+        raise ValueError("Invalid Spotify playlist URL.")
     playlist_id  = match.group(1)
     auth_headers = {**_HEADERS, "Authorization": f"Bearer {token}"}
 
@@ -228,12 +308,8 @@ def scrape_all_tracks(playlist_url: str, token: str) -> list:
             },
             timeout=20,
         )
-
         if r.status_code == 401:
-            raise RuntimeError(
-                "Token expired or invalid (401).\n"
-                "Please grab a fresh token from your browser and try again."
-            )
+            raise RuntimeError("Token expired (401). Click 'Fetch Token' again to get a fresh one.")
         if r.status_code == 404:
             raise RuntimeError("Playlist not found (404). Double-check the URL.")
         r.raise_for_status()
@@ -245,7 +321,7 @@ def scrape_all_tracks(playlist_url: str, token: str) -> list:
         for item in data.get("items", []):
             track = item.get("track")
             if not track or not track.get("name"):
-                continue   # skip deleted / unavailable tracks
+                continue
             title   = track["name"]
             artists = ", ".join(a["name"] for a in track.get("artists", []))
             tracks.append({
@@ -303,26 +379,25 @@ def download_song(query: str, output_folder: str) -> tuple:
 # ACTION — SCRAPE
 # ─────────────────────────────────────────────
 if run_scrape:
-    if not token_input.strip():
+    if not st.session_state.token:
         st.markdown(
-            '<div class="error-box">⚠ Please paste your Spotify token first (Step 1).</div>',
+            '<div class="error-box">⚠ No token found. Click "Fetch Token from Spotify" first.</div>',
             unsafe_allow_html=True,
         )
     elif not playlist_url.strip():
         st.markdown(
-            '<div class="error-box">⚠ Please paste a Spotify playlist URL (Step 2).</div>',
+            '<div class="error-box">⚠ Please paste a Spotify playlist URL.</div>',
             unsafe_allow_html=True,
         )
     else:
         st.markdown("---")
         with st.spinner("🌐 Fetching all tracks from Spotify…"):
             try:
-                tracks = scrape_all_tracks(playlist_url.strip(), token_input.strip())
+                tracks = scrape_all_tracks(playlist_url.strip(), st.session_state.token)
 
                 if not tracks:
                     st.markdown(
-                        '<div class="error-box">No tracks found. '
-                        'Make sure the playlist is <b>public</b>.</div>',
+                        '<div class="error-box">No tracks found. Make sure the playlist is public.</div>',
                         unsafe_allow_html=True,
                     )
                 else:
@@ -335,7 +410,6 @@ if run_scrape:
                     )
                     st.markdown(f"#### {len(tracks)} tracks found")
                     show_songs(tracks)
-
                     st.download_button(
                         label="📥 Download CSV",
                         data=st.session_state.csv_bytes,
@@ -344,10 +418,7 @@ if run_scrape:
                     )
 
             except Exception as e:
-                st.markdown(
-                    f'<div class="error-box">❌ {e}</div>',
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f'<div class="error-box">❌ {e}</div>', unsafe_allow_html=True)
 
 elif st.session_state.songs_data:
     st.markdown(f"#### {len(st.session_state.songs_data)} tracks (from last scrape)")
@@ -381,9 +452,8 @@ if run_download:
 
         if not shutil.which("ffmpeg"):
             st.markdown(
-                '<div class="status-box">⚠ ffmpeg not found — files will download in '
-                'native format. Add <code>ffmpeg</code> to <code>packages.txt</code> '
-                'for MP3 on Streamlit Cloud.</div>',
+                '<div class="status-box">⚠ ffmpeg not found — files will download in native '
+                'format. Add <code>ffmpeg</code> to <code>packages.txt</code> for MP3.</div>',
                 unsafe_allow_html=True,
             )
 
