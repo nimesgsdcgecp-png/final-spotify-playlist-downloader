@@ -1,26 +1,12 @@
 import streamlit as st
-from playwright.sync_api import sync_playwright
+import requests
+import re
 import csv
 import os
 import subprocess
-import threading
-import asyncio
 import tempfile
 import shutil
 import io
-
-# ─────────────────────────────────────────────
-# INSTALL PLAYWRIGHT BROWSERS ON STREAMLIT CLOUD
-# Runs once per container boot via cache_resource.
-# ─────────────────────────────────────────────
-@st.cache_resource(show_spinner=False)
-def install_playwright_browsers():
-    subprocess.run(["playwright", "install", "chromium"], capture_output=True)
-    subprocess.run(["playwright", "install-deps", "chromium"], capture_output=True)
-    return True
-
-install_playwright_browsers()
-
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -126,7 +112,7 @@ st.markdown("""
 # HEADER
 # ─────────────────────────────────────────────
 st.markdown("<h1>🎵 Spotify Playlist Downloader</h1>", unsafe_allow_html=True)
-st.markdown('<p class="subtitle">Scrape → CSV → Download. No API needed.</p>', unsafe_allow_html=True)
+st.markdown('<p class="subtitle">Scrape → CSV → Download. No API key needed.</p>', unsafe_allow_html=True)
 st.markdown("---")
 
 
@@ -140,7 +126,7 @@ if "csv_bytes" not in st.session_state:
 
 
 # ─────────────────────────────────────────────
-# STEP 1 — INPUTS
+# INPUTS
 # ─────────────────────────────────────────────
 st.markdown("### Step 1 — Paste your Spotify Playlist URL")
 playlist_url = st.text_input(
@@ -151,8 +137,9 @@ playlist_url = st.text_input(
 
 st.markdown("### Step 2 — Choose Download Folder")
 
-# On Streamlit Cloud only /tmp is writable. Locally use ~/spotify_downloads.
-_is_cloud = bool(os.environ.get("STREAMLIT_SHARING_MODE") or os.environ.get("IS_CLOUD"))
+# On Streamlit Cloud only /tmp is writable.
+# Locally this falls back to ~/spotify_downloads.
+_is_cloud    = bool(os.environ.get("STREAMLIT_SHARING_MODE") or os.environ.get("IS_CLOUD"))
 _default_dir = (
     os.path.join(tempfile.gettempdir(), "spotify_downloads")
     if _is_cloud
@@ -162,7 +149,7 @@ _default_dir = (
 output_dir = st.text_input(
     label="Download folder",
     value=_default_dir,
-    help="On Streamlit Cloud only /tmp paths are writable. Locally use any path.",
+    help="On Streamlit Cloud only /tmp paths are writable. Locally, use any path.",
     label_visibility="collapsed",
 )
 
@@ -174,126 +161,147 @@ with col2:
 
 
 # ─────────────────────────────────────────────
-# HELPERS
+# SPOTIFY SCRAPING — pure requests, no browser
 # ─────────────────────────────────────────────
 
-def _playwright_worker(url: str, result_bucket: list, error_bucket: list):
+# These headers make Spotify's server think we are a normal browser.
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept":          "application/json",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer":         "https://open.spotify.com/",
+}
+
+
+def _get_spotify_token() -> str:
     """
-    YOUR ORIGINAL PLAYWRIGHT SCROLL LOGIC — completely untouched.
+    Fetch Spotify's anonymous web-player bearer token.
+    This is the exact same token Spotify's own browser fetches
+    before showing you a playlist — no credentials needed.
 
-    Runs in its own thread with a fresh asyncio event loop to avoid
-    the Windows/Streamlit NotImplementedError conflict.
-
-    Extended args list prevents the "Target crashed" OOM error on
-    Streamlit Cloud which has ~800MB RAM shared with the app itself.
+    Tries the primary endpoint first, falls back to scraping
+    the HTML if the JSON endpoint changes.
     """
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
-    # Memory-saving Chromium flags for low-RAM environments (Streamlit Cloud).
-    # These are safe to use locally too — they're just ignored when RAM is plentiful.
-    CHROMIUM_ARGS = [
-        "--no-sandbox",
-        "--disable-dev-shm-usage",       # Use /tmp instead of /dev/shm (fixes OOM crash)
-        "--disable-gpu",                  # No GPU in a container
-        "--single-process",               # One process instead of renderer + browser
-        "--no-zygote",                    # Skip zygote process (saves ~50MB)
-        "--disable-extensions",
-        "--disable-background-networking",
-        "--disable-default-apps",
-        "--disable-sync",
-        "--disable-translate",
-        "--hide-scrollbars",
-        "--mute-audio",
-        "--no-first-run",
-        "--disable-backgrounding-occluded-windows",
-        "--disable-renderer-backgrounding",
-        "--disable-features=TranslateUI,BlinkGenPropertyTrees",
-        "--memory-pressure-off",          # Don't kill tabs under memory pressure
-        "--js-flags=--max-old-space-size=256",  # Cap JS heap at 256MB
-    ]
-
+    # Primary: dedicated JSON endpoint
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(
-                headless=True,
-                args=CHROMIUM_ARGS,
-            )
-            # Limit viewport — smaller viewport = less rendering memory
-            page = browser.new_page(viewport={"width": 1280, "height": 800})
-            page.goto(url)
+        r = requests.get(
+            "https://open.spotify.com/get_access_token"
+            "?reason=transport&productType=web_player",
+            headers=_HEADERS,
+            timeout=15,
+        )
+        r.raise_for_status()
+        data  = r.json()
+        token = data.get("accessToken") or data.get("access_token")
+        if token:
+            return token
+    except Exception:
+        pass
 
-            page.wait_for_timeout(3000)          # Wait for initial load
+    # Fallback: scrape token from the Spotify home page HTML
+    r = requests.get("https://open.spotify.com/", headers=_HEADERS, timeout=15)
+    r.raise_for_status()
+    match = re.search(r'"accessToken"\s*:\s*"([^"]+)"', r.text)
+    if match:
+        return match.group(1)
 
-            prev_count = 0
-            while True:
-                rows = page.query_selector_all("div[data-testid='tracklist-row']")
-
-                if len(rows) == prev_count:
-                    break                        # Nothing new loaded
-
-                prev_count = len(rows)
-
-                rows[-1].scroll_into_view_if_needed()   # Triggers lazy load
-                page.wait_for_timeout(2000)
-
-            # Scrape all loaded rows  ← your original line
-            rows = page.query_selector_all("div[data-testid='tracklist-row']")
-            for row in rows:
-                result_bucket.append(row.inner_text())
-
-            browser.close()
-    except Exception as e:
-        error_bucket.append(e)
-
-
-def scrape_playlist(url: str) -> list:
-    """
-    Spawns _playwright_worker in a thread and waits for it to finish.
-    Keeps Playwright isolated from Streamlit's event loop on all platforms.
-    """
-    result_bucket: list = []
-    error_bucket:  list = []
-
-    t = threading.Thread(
-        target=_playwright_worker,
-        args=(url, result_bucket, error_bucket),
+    raise RuntimeError(
+        "Could not retrieve a Spotify token.\n"
+        "Possible causes:\n"
+        "• Spotify changed their web-player endpoint\n"
+        "• The server is temporarily blocking requests\n"
+        "Try again in a minute."
     )
-    t.start()
-    t.join()
-
-    if error_bucket:
-        raise error_bucket[0]
-
-    return result_bucket
 
 
-def parse_song(raw_text: str) -> tuple:
+def scrape_all_tracks(playlist_url: str) -> list:
     """
-    Spotify tracklist inner_text looks like:
-        '1\\nSong Title\\nArtist Name\\n3:45'
+    Fetch ALL tracks from a public Spotify playlist.
+
+    Steps:
+      1. Extract playlist ID from the URL.
+      2. Get an anonymous bearer token from Spotify's web-player.
+      3. Paginate through /v1/playlists/{id}/tracks in batches of 100
+         until every track is collected.
+
+    Returns a list of dicts:
+        { index, title, artist, search_query }
     """
-    parts = [p.strip() for p in raw_text.strip().split("\n") if p.strip()]
-    title  = parts[1] if len(parts) > 1 else parts[0]
-    artist = parts[2] if len(parts) > 2 else "Unknown Artist"
-    return title, artist
+    match = re.search(r"playlist/([A-Za-z0-9]+)", playlist_url)
+    if not match:
+        raise ValueError(
+            "Could not find a playlist ID in that URL.\n"
+            "It should look like: https://open.spotify.com/playlist/XXXX"
+        )
+    playlist_id = match.group(1)
 
+    token        = _get_spotify_token()
+    auth_headers = {**_HEADERS, "Authorization": f"Bearer {token}"}
 
-def raw_to_tracks(raw_songs: list) -> list:
-    """Convert list of inner_text strings → list of track dicts."""
     tracks = []
-    for i, raw in enumerate(raw_songs, start=1):
-        title, artist = parse_song(raw)
-        tracks.append({
-            "index":        i,
-            "title":        title,
-            "artist":       artist,
-            "search_query": f"{title} {artist}",
-        })
+    offset = 0
+    limit  = 100
+
+    while True:
+        r = requests.get(
+            f"https://api.spotify.com/v1/playlists/{playlist_id}/tracks",
+            headers=auth_headers,
+            params={
+                "limit":  limit,
+                "offset": offset,
+                "fields": "items(track(name,artists(name))),next,total",
+            },
+            timeout=20,
+        )
+
+        if r.status_code == 401:
+            raise RuntimeError(
+                "Spotify returned 401 Unauthorized.\n"
+                "The playlist is likely private — set it to Public and try again."
+            )
+        if r.status_code == 404:
+            raise RuntimeError(
+                "Playlist not found (404). Double-check the URL."
+            )
+        r.raise_for_status()
+
+        data = r.json()
+        if "error" in data:
+            raise RuntimeError(f"Spotify API error: {data['error']['message']}")
+
+        for item in data.get("items", []):
+            track = item.get("track")
+            # Skip None entries (deleted/unavailable tracks in a playlist)
+            if not track or not track.get("name"):
+                continue
+            title   = track["name"]
+            artists = ", ".join(a["name"] for a in track.get("artists", []))
+            tracks.append({
+                "index":        len(tracks) + 1,
+                "title":        title,
+                "artist":       artists,
+                "search_query": f"{title} {artists}",
+            })
+
+        # Spotify returns null for "next" when we've reached the last page
+        if not data.get("next"):
+            break
+
+        offset += limit
+
     return tracks
 
 
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+
 def tracks_to_csv_bytes(tracks: list) -> bytes:
-    buf = io.StringIO()
+    buf    = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=["index", "title", "artist", "search_query"])
     writer.writeheader()
     writer.writerows(tracks)
@@ -313,8 +321,8 @@ def show_songs(songs_data: list):
 
 def download_song(query: str, output_folder: str) -> tuple:
     """
-    Search YouTube for `query` and download as MP3 via yt-dlp.
-    Falls back to best native audio if ffmpeg is absent.
+    Search YouTube for `query` and save as MP3 via yt-dlp.
+    Falls back to native audio format if ffmpeg is not installed.
     """
     os.makedirs(output_folder, exist_ok=True)
     has_ffmpeg = shutil.which("ffmpeg") is not None
@@ -345,48 +353,41 @@ if run_scrape:
         )
     else:
         st.markdown("---")
-        st.markdown("### Scraping playlist…")
-        status = st.empty()
-        status.markdown(
-            '<div class="status-box">🌐 Launching browser & scrolling through playlist…</div>',
-            unsafe_allow_html=True,
-        )
+        st.markdown("### Fetching playlist…")
+        with st.spinner("🌐 Contacting Spotify…"):
+            try:
+                tracks = scrape_all_tracks(playlist_url.strip())
 
-        try:
-            raw_songs = scrape_playlist(playlist_url.strip())
+                if not tracks:
+                    st.markdown(
+                        '<div class="error-box">No tracks found. '
+                        'Make sure the playlist is <b>public</b> and the URL is correct.</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    # Persist across reruns
+                    st.session_state.songs_data = tracks
+                    st.session_state.csv_bytes  = tracks_to_csv_bytes(tracks)
 
-            if not raw_songs:
+                    st.markdown(
+                        f'<div class="status-box">✅ Found <b>{len(tracks)}</b> tracks</div>',
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(f"#### {len(tracks)} tracks found")
+                    show_songs(tracks)
+
+                    st.download_button(
+                        label="📥 Download CSV",
+                        data=st.session_state.csv_bytes,
+                        file_name="playlist_songs.csv",
+                        mime="text/csv",
+                    )
+
+            except Exception as e:
                 st.markdown(
-                    '<div class="error-box">No tracks found. '
-                    'Make sure the playlist is public and the URL is correct.</div>',
+                    f'<div class="error-box">❌ {e}</div>',
                     unsafe_allow_html=True,
                 )
-            else:
-                tracks = raw_to_tracks(raw_songs)
-
-                # Persist in session state — survives button reruns
-                st.session_state.songs_data = tracks
-                st.session_state.csv_bytes  = tracks_to_csv_bytes(tracks)
-
-                status.markdown(
-                    f'<div class="status-box">✅ Found <b>{len(tracks)}</b> tracks</div>',
-                    unsafe_allow_html=True,
-                )
-                st.markdown(f"#### {len(tracks)} tracks found")
-                show_songs(tracks)
-
-                st.download_button(
-                    label="📥 Download CSV",
-                    data=st.session_state.csv_bytes,
-                    file_name="playlist_songs.csv",
-                    mime="text/csv",
-                )
-
-        except Exception as e:
-            st.markdown(
-                f'<div class="error-box">❌ {e}</div>',
-                unsafe_allow_html=True,
-            )
 
 # Keep showing previously scraped songs after any rerun
 elif st.session_state.songs_data:
@@ -423,7 +424,7 @@ if run_download:
             st.markdown(
                 '<div class="status-box">⚠ ffmpeg not found — files will download in '
                 'native format instead of MP3. Add <code>ffmpeg</code> to '
-                '<code>packages.txt</code> to fix this on Streamlit Cloud.</div>',
+                '<code>packages.txt</code> to enable MP3 on Streamlit Cloud.</div>',
                 unsafe_allow_html=True,
             )
 
