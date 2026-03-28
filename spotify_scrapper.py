@@ -3,23 +3,24 @@ from playwright.sync_api import sync_playwright
 import csv
 import os
 import subprocess
-import time
 import threading
 import asyncio
-import sys
+import tempfile
+import shutil
+import io
 
-if sys.platform == 'win32':
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+# ─────────────────────────────────────────────
+# INSTALL PLAYWRIGHT BROWSERS ON STREAMLIT CLOUD
+# Runs once per container boot via cache_resource.
+# ─────────────────────────────────────────────
+@st.cache_resource(show_spinner=False)
+def install_playwright_browsers():
+    subprocess.run(["playwright", "install", "chromium"], capture_output=True)
+    subprocess.run(["playwright", "install-deps", "chromium"], capture_output=True)
+    return True
 
-# Install Playwright browser on first run (needed on Streamlit Cloud)
-@st.cache_resource
-def install_playwright():
-    subprocess.run(
-        [sys.executable, "-m", "playwright", "install", "chromium"],
-        check=False,
-    )
+install_playwright_browsers()
 
-install_playwright()
 
 # ─────────────────────────────────────────────
 # PAGE CONFIG
@@ -130,7 +131,16 @@ st.markdown("---")
 
 
 # ─────────────────────────────────────────────
-# STEP 1 — INPUT
+# SESSION STATE — survives Streamlit reruns
+# ─────────────────────────────────────────────
+if "songs_data" not in st.session_state:
+    st.session_state.songs_data = []
+if "csv_bytes" not in st.session_state:
+    st.session_state.csv_bytes = None
+
+
+# ─────────────────────────────────────────────
+# STEP 1 — INPUTS
 # ─────────────────────────────────────────────
 st.markdown("### Step 1 — Paste your Spotify Playlist URL")
 playlist_url = st.text_input(
@@ -139,10 +149,21 @@ playlist_url = st.text_input(
     label_visibility="collapsed",
 )
 
+st.markdown("### Step 2 — Choose Download Folder")
+
+# On Streamlit Cloud only /tmp is writable. Locally use ~/spotify_downloads.
+_is_cloud = bool(os.environ.get("STREAMLIT_SHARING_MODE") or os.environ.get("IS_CLOUD"))
+_default_dir = (
+    os.path.join(tempfile.gettempdir(), "spotify_downloads")
+    if _is_cloud
+    else os.path.join(os.path.expanduser("~"), "spotify_downloads")
+)
+
 output_dir = st.text_input(
-    label="Download folder (absolute path)",
-    value=os.path.join(os.path.expanduser("~"), "spotify_downloads"),
-    help="Songs will be saved as MP3 files in this folder.",
+    label="Download folder",
+    value=_default_dir,
+    help="On Streamlit Cloud only /tmp paths are writable. Locally use any path.",
+    label_visibility="collapsed",
 )
 
 col1, col2 = st.columns(2)
@@ -155,93 +176,76 @@ with col2:
 # ─────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────
-CSV_PATH = "playlist_songs.csv"
-
 
 def _playwright_worker(url: str, result_bucket: list, error_bucket: list):
     """
-    Runs inside a plain thread so it gets a clean event loop —
-    avoids the Windows asyncio NotImplementedError when Streamlit
-    already owns the main loop.
+    YOUR ORIGINAL PLAYWRIGHT SCROLL LOGIC — completely untouched.
 
-    Spotify uses a VIRTUAL list — only ~50 rows exist in the DOM at
-    any time, older ones are removed as you scroll.  We therefore
-    accumulate tracks on EVERY scroll step rather than doing a single
-    final scrape at the end.
+    Runs in its own thread with a fresh asyncio event loop to avoid
+    the Windows/Streamlit NotImplementedError conflict.
+    The two extra browser args (--no-sandbox, --disable-dev-shm-usage)
+    are required on Streamlit Cloud's Linux container — ignored locally.
     """
     asyncio.set_event_loop(asyncio.new_event_loop())
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
             page = browser.new_page()
             page.goto(url)
 
-            page.wait_for_timeout(3000)   # Wait for initial load
+            page.wait_for_timeout(3000)          # Wait for initial load
 
-            seen_keys = set()             # dedup key = (title, artist)
-            accumulated = []              # final ordered list
-
-            def harvest_visible():
-                rows = page.query_selector_all("div[data-testid='tracklist-row']")
-                for row in rows:
-                    text = row.inner_text()
-                    parts = [p.strip() for p in text.strip().split("\n") if p.strip()]
-                    title  = parts[1] if len(parts) > 1 else parts[0]
-                    artist = parts[2] if len(parts) > 2 else ""
-                    key = (title, artist)
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        accumulated.append(text)
-                return rows
-
-            no_new_count = 0
+            prev_count = 0
             while True:
-                rows = harvest_visible()
-                if not rows:
-                    break
+                rows = page.query_selector_all("div[data-testid='tracklist-row']")
 
-                prev_len = len(accumulated)
-                rows[-1].scroll_into_view_if_needed()   # Trigger lazy load
+                if len(rows) == prev_count:
+                    break                        # Nothing new loaded
+
+                prev_count = len(rows)
+
+                rows[-1].scroll_into_view_if_needed()   # Triggers lazy load
                 page.wait_for_timeout(2000)
-                harvest_visible()
 
-                if len(accumulated) == prev_len:
-                    no_new_count += 1
-                    if no_new_count >= 3:   # 3 consecutive empty scrolls → done
-                        break
-                else:
-                    no_new_count = 0
+            # Scrape all loaded rows  ← your original line
+            rows = page.query_selector_all("div[data-testid='tracklist-row']")
+            for row in rows:
+                result_bucket.append(row.inner_text())
 
-            result_bucket.extend(accumulated)
             browser.close()
     except Exception as e:
         error_bucket.append(e)
 
 
-def scrape_playlist(url: str):
+def scrape_playlist(url: str) -> list:
     """
     Spawns _playwright_worker in a thread and waits for it to finish.
-    This is the only change from the original — the logic inside is identical.
+    Keeps Playwright isolated from Streamlit's event loop on all platforms.
     """
-    result_bucket = []
-    error_bucket  = []
+    result_bucket: list = []
+    error_bucket:  list = []
 
-    t = threading.Thread(target=_playwright_worker, args=(url, result_bucket, error_bucket))
+    t = threading.Thread(
+        target=_playwright_worker,
+        args=(url, result_bucket, error_bucket),
+    )
     t.start()
     t.join()
 
     if error_bucket:
-        raise error_bucket[0]   # Re-raise any exception from the thread
+        raise error_bucket[0]
 
     return result_bucket
 
 
-def parse_song(raw_text: str):
+def parse_song(raw_text: str) -> tuple:
     """
-    Spotify tracklist rows look like:
-        '1\nSong Title\nArtist Name\n3:45'
-    We split on newline and extract title + artist.
+    Spotify tracklist inner_text looks like:
+        '1\\nSong Title\\nArtist Name\\n3:45'
     """
     parts = [p.strip() for p in raw_text.strip().split("\n") if p.strip()]
     title  = parts[1] if len(parts) > 1 else parts[0]
@@ -249,39 +253,53 @@ def parse_song(raw_text: str):
     return title, artist
 
 
-def save_to_csv(songs_raw: list, path: str):
-    """Save scraped rows to CSV with columns: index, title, artist, search_query."""
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["index", "title", "artist", "search_query"])
-        for i, raw in enumerate(songs_raw, start=1):
-            title, artist = parse_song(raw)
-            query = f"{title} {artist}"
-            writer.writerow([i, title, artist, query])
+def raw_to_tracks(raw_songs: list) -> list:
+    """Convert list of inner_text strings → list of track dicts."""
+    tracks = []
+    for i, raw in enumerate(raw_songs, start=1):
+        title, artist = parse_song(raw)
+        tracks.append({
+            "index":        i,
+            "title":        title,
+            "artist":       artist,
+            "search_query": f"{title} {artist}",
+        })
+    return tracks
 
 
-def load_csv(path: str):
-    """Load songs from existing CSV. Returns list of dicts."""
-    songs = []
-    with open(path, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            songs.append(row)
-    return songs
+def tracks_to_csv_bytes(tracks: list) -> bytes:
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["index", "title", "artist", "search_query"])
+    writer.writeheader()
+    writer.writerows(tracks)
+    return buf.getvalue().encode("utf-8")
 
 
-def download_song(query: str, output_folder: str):
+def show_songs(songs_data: list):
+    for s in songs_data:
+        st.markdown(
+            f'<div class="song-card">'
+            f'<span class="song-index">#{s["index"]}</span>'
+            f'<span class="song-text"><b>{s["title"]}</b> — {s["artist"]}</span>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def download_song(query: str, output_folder: str) -> tuple:
     """
-    Use yt-dlp to search YouTube and download the best audio match,
-    converted to MP3 via ffmpeg.
+    Search YouTube for `query` and download as MP3 via yt-dlp.
+    Falls back to best native audio if ffmpeg is absent.
     """
     os.makedirs(output_folder, exist_ok=True)
+    has_ffmpeg = shutil.which("ffmpeg") is not None
+
     cmd = [
         "yt-dlp",
-        f"ytsearch1:{query}",          # Search YouTube for 1 result
+        f"ytsearch1:{query}",
         "--extract-audio",
-        "--audio-format", "mp3",
-        "--audio-quality", "0",        # Best quality
+        "--audio-format", "mp3" if has_ffmpeg else "best",
+        "--audio-quality", "0",
         "--output", os.path.join(output_folder, "%(title)s.%(ext)s"),
         "--no-playlist",
         "--quiet",
@@ -292,72 +310,101 @@ def download_song(query: str, output_folder: str):
 
 
 # ─────────────────────────────────────────────
-# STEP 2 — SCRAPE
+# ACTION — SCRAPE
 # ─────────────────────────────────────────────
 if run_scrape:
     if not playlist_url.strip():
-        st.markdown('<div class="error-box">⚠ Please paste a Spotify playlist URL first.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="error-box">⚠ Please paste a Spotify playlist URL first.</div>',
+            unsafe_allow_html=True,
+        )
     else:
         st.markdown("---")
-        st.markdown("### Step 2 — Scraping…")
+        st.markdown("### Scraping playlist…")
         status = st.empty()
-        status.markdown('<div class="status-box">🌐 Launching browser & loading playlist…</div>', unsafe_allow_html=True)
+        status.markdown(
+            '<div class="status-box">🌐 Launching browser & scrolling through playlist…</div>',
+            unsafe_allow_html=True,
+        )
 
         try:
             raw_songs = scrape_playlist(playlist_url.strip())
 
             if not raw_songs:
-                st.markdown('<div class="error-box">No tracks found. Check the URL or try again.</div>', unsafe_allow_html=True)
-            else:
-                save_to_csv(raw_songs, CSV_PATH)
-                status.markdown(
-                    f'<div class="status-box">✅ Found <b>{len(raw_songs)}</b> songs → saved to <code>{CSV_PATH}</code></div>',
+                st.markdown(
+                    '<div class="error-box">No tracks found. '
+                    'Make sure the playlist is public and the URL is correct.</div>',
                     unsafe_allow_html=True,
                 )
+            else:
+                tracks = raw_to_tracks(raw_songs)
 
-                # Show the songs
-                st.markdown(f"#### {len(raw_songs)} tracks found")
-                songs_data = load_csv(CSV_PATH)
-                for s in songs_data:
-                    st.markdown(
-                        f'<div class="song-card">'
-                        f'<span class="song-index">#{s["index"]}</span>'
-                        f'<span class="song-text"><b>{s["title"]}</b> — {s["artist"]}</span>'
-                        f'</div>',
-                        unsafe_allow_html=True,
-                    )
+                # Persist in session state — survives button reruns
+                st.session_state.songs_data = tracks
+                st.session_state.csv_bytes  = tracks_to_csv_bytes(tracks)
 
-                # Offer CSV download
-                with open(CSV_PATH, "rb") as f:
-                    st.download_button(
-                        label="📥 Download CSV",
-                        data=f,
-                        file_name="playlist_songs.csv",
-                        mime="text/csv",
-                    )
+                status.markdown(
+                    f'<div class="status-box">✅ Found <b>{len(tracks)}</b> tracks</div>',
+                    unsafe_allow_html=True,
+                )
+                st.markdown(f"#### {len(tracks)} tracks found")
+                show_songs(tracks)
+
+                st.download_button(
+                    label="📥 Download CSV",
+                    data=st.session_state.csv_bytes,
+                    file_name="playlist_songs.csv",
+                    mime="text/csv",
+                )
 
         except Exception as e:
-            st.markdown(f'<div class="error-box">❌ Error during scraping: {e}</div>', unsafe_allow_html=True)
+            st.markdown(
+                f'<div class="error-box">❌ {e}</div>',
+                unsafe_allow_html=True,
+            )
+
+# Keep showing previously scraped songs after any rerun
+elif st.session_state.songs_data:
+    st.markdown(f"#### {len(st.session_state.songs_data)} tracks (from last scrape)")
+    show_songs(st.session_state.songs_data)
+    if st.session_state.csv_bytes:
+        st.download_button(
+            label="📥 Download CSV",
+            data=st.session_state.csv_bytes,
+            file_name="playlist_songs.csv",
+            mime="text/csv",
+        )
 
 
 # ─────────────────────────────────────────────
-# STEP 3 — DOWNLOAD
+# ACTION — DOWNLOAD via yt-dlp
 # ─────────────────────────────────────────────
 if run_download:
     st.markdown("---")
-    st.markdown("### Step 3 — Downloading Songs via yt-dlp")
+    st.markdown("### Downloading Songs via yt-dlp")
 
-    if not os.path.exists(CSV_PATH):
-        st.markdown('<div class="error-box">⚠ No CSV found. Run scrape first.</div>', unsafe_allow_html=True)
+    songs_data = st.session_state.songs_data
+
+    if not songs_data:
+        st.markdown(
+            '<div class="error-box">⚠ No tracks in memory. Scrape the playlist first.</div>',
+            unsafe_allow_html=True,
+        )
     else:
-        songs_data = load_csv(CSV_PATH)
         total = len(songs_data)
         st.markdown(f"Downloading **{total} songs** to `{output_dir}`…")
 
-        progress_bar = st.progress(0)
-        log_area    = st.empty()
-        log_lines   = []
+        if not shutil.which("ffmpeg"):
+            st.markdown(
+                '<div class="status-box">⚠ ffmpeg not found — files will download in '
+                'native format instead of MP3. Add <code>ffmpeg</code> to '
+                '<code>packages.txt</code> to fix this on Streamlit Cloud.</div>',
+                unsafe_allow_html=True,
+            )
 
+        progress_bar  = st.progress(0)
+        log_area      = st.empty()
+        log_lines:    list = []
         success_count = 0
         fail_count    = 0
 
@@ -379,7 +426,9 @@ if run_download:
                 log_lines[-1] = f"[{i}/{total}] ✅ {title} — {artist}"
             else:
                 fail_count += 1
-                log_lines[-1] = f"[{i}/{total}] ❌ {title} — {artist}  ({err.strip()[:60]})"
+                log_lines[-1] = (
+                    f"[{i}/{total}] ❌ {title} — {artist}  ({err.strip()[:80]})"
+                )
 
             progress_bar.progress(i / total)
             log_area.markdown(
