@@ -183,18 +183,43 @@ def _playwright_worker(url: str, result_bucket: list, error_bucket: list):
 
     Runs in its own thread with a fresh asyncio event loop to avoid
     the Windows/Streamlit NotImplementedError conflict.
-    The two extra browser args (--no-sandbox, --disable-dev-shm-usage)
-    are required on Streamlit Cloud's Linux container — ignored locally.
+
+    Extended args list prevents the "Target crashed" OOM error on
+    Streamlit Cloud which has ~800MB RAM shared with the app itself.
     """
     asyncio.set_event_loop(asyncio.new_event_loop())
+
+    # Memory-saving Chromium flags for low-RAM environments (Streamlit Cloud).
+    # These are safe to use locally too — they're just ignored when RAM is plentiful.
+    CHROMIUM_ARGS = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",       # Use /tmp instead of /dev/shm (fixes OOM crash)
+        "--disable-gpu",                  # No GPU in a container
+        "--single-process",               # One process instead of renderer + browser
+        "--no-zygote",                    # Skip zygote process (saves ~50MB)
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-default-apps",
+        "--disable-sync",
+        "--disable-translate",
+        "--hide-scrollbars",
+        "--mute-audio",
+        "--no-first-run",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-features=TranslateUI,BlinkGenPropertyTrees",
+        "--memory-pressure-off",          # Don't kill tabs under memory pressure
+        "--js-flags=--max-old-space-size=256",  # Cap JS heap at 256MB
+    ]
 
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
+                args=CHROMIUM_ARGS,
             )
-            page = browser.new_page()
+            # Limit viewport — smaller viewport = less rendering memory
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
             page.goto(url)
 
             page.wait_for_timeout(3000)          # Wait for initial load
